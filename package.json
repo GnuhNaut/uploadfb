@@ -1,0 +1,24 @@
+{
+  "name": "uploadfb",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "axios": "^1.15.2",
+    "better-sqlite3": "^12.9.0",
+    "dotenv": "^17.4.2",
+    "facebook-nodejs-business-sdk": "^24.0.1",
+    "fs-extra": "^11.3.4",
+    "input": "^1.0.1",
+    "playwright": "^1.59.1",
+    "pm2": "^6.0.14",
+    "telegram": "^2.26.22"
+  }
+}
