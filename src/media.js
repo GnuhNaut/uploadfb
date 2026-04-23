@@ -13,29 +13,33 @@ export async function initMediaDir() {
 }
 
 /**
- * Clean up files in the temp directory
- * @param {string} filePath 
+ * Clean up files in the temp directory, keeping only the 5 most recent
  */
-export async function cleanupMedia(filePath) {
+export async function cleanupOldMedia() {
   try {
-    if (filePath && await fs.pathExists(filePath)) {
-      await fs.remove(filePath);
-      console.log(`[Media] Cleaned up file: ${filePath}`);
+    const files = await fs.readdir(tempDir);
+    if (files.length <= 5) return;
+
+    // Get files with stats
+    const filesWithStats = await Promise.all(
+      files.map(async (file) => {
+        const filePath = path.join(tempDir, file);
+        const stats = await fs.stat(filePath);
+        return { filePath, ctime: stats.ctime.getTime() };
+      })
+    );
+
+    // Sort by creation time descending (newest first)
+    filesWithStats.sort((a, b) => b.ctime - a.ctime);
+
+    // Keep first 5, delete the rest
+    const filesToDelete = filesWithStats.slice(5);
+    for (const fileObj of filesToDelete) {
+      await fs.remove(fileObj.filePath);
+      console.log(`[Media] Cleaned up old file: ${fileObj.filePath}`);
     }
   } catch (error) {
-    console.error(`[Media] Error cleaning up file ${filePath}:`, error.message);
-  }
-}
-
-/**
- * Clean up all files in temp directory
- */
-export async function cleanupAllMedia() {
-  try {
-    await fs.emptyDir(tempDir);
-    console.log(`[Media] Cleaned up all temp files.`);
-  } catch (error) {
-    console.error(`[Media] Error cleaning up temp dir:`, error.message);
+    console.error(`[Media] Error cleaning up old media:`, error.message);
   }
 }
 

@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-import { initMediaDir, cleanupAllMedia } from './media.js';
+import { initMediaDir, cleanupOldMedia } from './media.js';
 import { startTelegramClient } from './telegram.js';
 
 dotenv.config();
@@ -13,7 +13,7 @@ async function main() {
     // 1. Initialize Temp Directory
     await initMediaDir();
     // Clear out any old temp media on boot
-    await cleanupAllMedia();
+    await cleanupOldMedia();
 
     // 2. Start Telegram client and listeners
     await startTelegramClient();
