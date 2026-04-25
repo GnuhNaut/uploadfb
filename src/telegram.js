@@ -2,7 +2,7 @@ import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { NewMessage } from 'telegram/events/index.js';
 import dotenv from 'dotenv';
-import { isMessageProcessed, markMessageProcessed } from './db.js';
+import { isMessageProcessed, markMessageProcessed, updateMessageStatus } from './db.js';
 import { publishToFacebook } from './facebook/index.js';
 import { getTempFilePath, cleanupOldMedia } from './media.js';
 import { sendAlert } from './alert.js';
@@ -15,8 +15,12 @@ const apiHash = process.env.TG_API_HASH || "8a0af2c18a8c3aeebd26f0a277e7e9c0";
 const botToken = process.env.TG_BOT_TOKEN;
 const adminGroupId = process.env.TG_ADMIN_GROUP_ID ? process.env.TG_ADMIN_GROUP_ID.trim() : null;
 
-// Global buffer cho các message đến sát nhau
+// Global buffer cho các message đến sát nhau (album grouping)
 const albumBuffer = new Map();
+
+// Global lock: Set chứa các message ID đang được xử lý hoặc đã xử lý
+// Ngăn race condition khi Telegram gửi duplicate events
+const processingMessages = new Set();
 
 export let client;
 
@@ -68,43 +72,101 @@ async function handleNewMessage(event) {
   // Normalize IDs to handle Bot API vs MTProto differences (-100 prefix)
   const normChannelId = channelId.replace(/^-100|^-/, '');
   const normAdminId = adminGroupId ? adminGroupId.replace(/^-100|^-/, '') : null;
-  console.log(`[Debug] Nhận tin nhắn từ Group ID: ${channelId} (chuẩn hóa: ${normChannelId})`);
   
   // Check if channel is our admin group
   if (normAdminId && normChannelId !== normAdminId && chat.username !== adminGroupId) {
-    console.log(`[Debug] Đã bỏ qua tin vì ID chuẩn hóa ${normChannelId} không khớp với ${normAdminId}`);
     return;
   }
 
-  // 1. Khởi tạo Buffer chung theo Group (Chat)
-  if (!albumBuffer.has(channelId)) {
-    albumBuffer.set(channelId, {
-      timer: setTimeout(() => processChatBuffer(channelId, chat), 4000),
-      messages: []
-    });
+  const messageId = message.id;
+
+  // === DEDUP CHECK 1: In-memory lock ===
+  // Nếu message này đang được xử lý hoặc đã xử lý rồi → bỏ qua
+  if (processingMessages.has(messageId)) {
+    console.log(`[Dedup] Message ${messageId} đang/đã được xử lý, bỏ qua duplicate event.`);
+    return;
   }
-  albumBuffer.get(channelId).messages.push(message);
+
+  // === DEDUP CHECK 2: Database check ===
+  // Kiểm tra ngay từ đầu, tránh buffering tin đã xử lý
+  if (isMessageProcessed(channelId, messageId.toString())) {
+    console.log(`[Dedup] Message ${messageId} đã có trong DB, bỏ qua.`);
+    processingMessages.add(messageId); // Thêm vào memory để lần sau không cần query DB
+    return;
+  }
+
+  // Kiểm tra xem tin nhắn có grouped_id (album) hay không
+  const groupedId = message.groupedId?.toString() || null;
+
+  if (groupedId) {
+    // === Xử lý ALBUM: gom các tin nhắn cùng groupedId ===
+    const bufferKey = `${channelId}_album_${groupedId}`;
+    
+    if (!albumBuffer.has(bufferKey)) {
+      albumBuffer.set(bufferKey, {
+        timer: setTimeout(() => processChatBuffer(bufferKey, channelId, chat), 4000),
+        messages: [],
+        seenIds: new Set(), // Dedup set
+      });
+    }
+
+    const group = albumBuffer.get(bufferKey);
+    // Dedup: chỉ thêm nếu chưa thấy message ID này
+    if (group.seenIds.has(messageId)) return;
+    group.seenIds.add(messageId);
+    group.messages.push(message);
+  } else {
+    // === Xử lý TIN NHẮN ĐƠN LẺ: không cần buffer, xử lý ngay ===
+    // Đánh dấu ngay vào memory lock để không bị duplicate
+    processingMessages.add(messageId);
+    
+    // Xử lý trực tiếp (không cần đợi 4 giây)
+    console.log(`\n[Telegram] Xử lý tin nhắn đơn lẻ (MessageID: ${messageId})`);
+    await processMessages([message], chat, channelId);
+  }
 }
 
-// Xử lý toàn bộ các tin nhắn đến cùng 1 lúc trong 4 giây
-async function processChatBuffer(channelId, chat) {
-  const group = albumBuffer.get(channelId);
+/**
+ * Xử lý toàn bộ các tin nhắn album đã gom trong 4 giây
+ */
+async function processChatBuffer(bufferKey, channelId, chat) {
+  const group = albumBuffer.get(bufferKey);
   if (!group) return;
-  albumBuffer.delete(channelId);
+  albumBuffer.delete(bufferKey);
   
   const messages = group.messages;
+  
+  // Lock tất cả message IDs trong album
+  for (const m of messages) {
+    processingMessages.add(m.id);
+  }
+
+  console.log(`\n[Telegram] Xử lý album ${messages.length} tin nhắn (IDs: ${messages.map(m => m.id).join(', ')})`);
   await processMessages(messages, chat, channelId);
 }
 
+/**
+ * Core processing: download media + upload to Facebook
+ */
 async function processMessages(messages, chat, channelId) {
   const mainMessageId = messages[0].id.toString();
 
-  // 1. Check Database
+  // === DEDUP CHECK 3: Final DB check trước khi upload ===
+  // Double-check vì có thể message đã được xử lý bởi một instance khác
   if (isMessageProcessed(channelId, mainMessageId)) {
+    console.log(`[Dedup] Message ${mainMessageId} đã xử lý (final check), bỏ qua.`);
     return;
   }
 
-  // 2. Trích xuất nội dung chữ (Caption)
+  // === MARK FIRST: Đánh dấu vào DB TRƯỚC khi upload ===
+  // Nếu insert thất bại (trả về false) → message đã bị xử lý bởi concurrent request
+  const wasInserted = markMessageProcessed(channelId, mainMessageId, 'uploading');
+  if (!wasInserted) {
+    console.log(`[Dedup] Message ${mainMessageId} đã bị claim bởi process khác, bỏ qua.`);
+    return;
+  }
+
+  // Trích xuất nội dung chữ (Caption)
   // Quét qua các tin nhắn, ƯU TIÊN LẤY TEXT DO BẠN TỰ GÕ (KHÔNG phải forward).
   // Vì text forward thường dính rác/quảng cáo của channel khác.
   const myTexts = messages.filter(m => !m.fwdFrom).map(m => m.message).filter(Boolean);
@@ -112,13 +174,15 @@ async function processMessages(messages, chat, channelId) {
 
   const hasMedia = messages.some(m => !!m.media);
 
-  if (!text && !hasMedia) return;
+  if (!text && !hasMedia) {
+    updateMessageStatus(channelId, mainMessageId, 'skipped');
+    return;
+  }
 
-  console.log(`\n[Telegram] Đang xử lý ${messages.length} tin nhắn (MessageID: ${mainMessageId})`);
   let downloadedFilePaths = [];
 
   try {
-    // 3. Process Media
+    // Process Media
     if (hasMedia) {
       for (const m of messages) {
         if (m.media) {
@@ -127,7 +191,7 @@ async function processMessages(messages, chat, channelId) {
           if (buffer) {
             const mime = m.media?.document?.mimeType || 'unknown';
             const ext = mime.includes('mp4') || mime.includes('video') ? '.mp4' : 
-                       (mime.includes('image') || mime.includes('jpeg') ? '.jpg' : '.bin');
+                       (mime.includes('image') || mime.includes('jpeg') ? '.jpg' : '.jpg');
             const path = getTempFilePath(`${Date.now()}_${m.id}${ext}`);
             
             await import('fs-extra').then(f => f.outputFile(path, buffer));
@@ -138,14 +202,14 @@ async function processMessages(messages, chat, channelId) {
       console.log(`[Media] Saved ${downloadedFilePaths.length} files.`);
     }
 
-    // 4. Publish to Facebook
+    // Publish to Facebook
     console.log(`[FB] Publishing...`);
     const fbPostId = await publishToFacebook(text, downloadedFilePaths.length > 0 ? downloadedFilePaths : null);
     
-    // 5. Success -> Update DB
-    markMessageProcessed(channelId, mainMessageId, 'success');
+    // Success -> Update status in DB
+    updateMessageStatus(channelId, mainMessageId, 'success');
 
-    // 6. Send Reply
+    // Send Reply
     const pageId = process.env.FB_PAGE_ID;
     
     // Thường FB trả về PAGEID_POSTID, nên ta tách lấy đoạn POSTID đằng sau
@@ -164,13 +228,14 @@ async function processMessages(messages, chat, channelId) {
     });
 
   } catch (error) {
-    // 7. Fail -> Log error
+    // Fail -> Update status
     const reqErrorMsg = `Failed to process/post message ${mainMessageId}.\nError: ${error.message}`;
     console.error(`[Error] ${reqErrorMsg}`);
-    markMessageProcessed(channelId, mainMessageId, 'failed');
+    updateMessageStatus(channelId, mainMessageId, 'failed');
     await client.sendMessage(chat.id, { message: `❌ Lỗi khi upload:\n${error.message}`, replyTo: messages[messages.length - 1].id });
   } finally {
-    // 8. Cleanup Old Media
+    // Cleanup Old Media
     await cleanupOldMedia();
   }
 }
+

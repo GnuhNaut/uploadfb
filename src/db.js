@@ -23,6 +23,21 @@ db.exec(`
   );
 `);
 
+// Add UNIQUE constraint to prevent duplicate message records.
+// Using CREATE UNIQUE INDEX IF NOT EXISTS so it's safe to run on existing databases.
+try {
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique ON messages(channel_id, message_id);`);
+} catch (e) {
+  // If index creation fails due to existing duplicates, clean up first
+  console.warn('[DB] Cleaning up duplicate records before creating unique index...');
+  db.exec(`
+    DELETE FROM messages WHERE id NOT IN (
+      SELECT MIN(id) FROM messages GROUP BY channel_id, message_id
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique ON messages(channel_id, message_id);
+  `);
+}
+
 /**
  * Check if a message has already been processed
  * @param {string} channelId 
@@ -36,14 +51,27 @@ export function isMessageProcessed(channelId, messageId) {
 }
 
 /**
- * Mark a message as processed
+ * Mark a message as processed (INSERT OR IGNORE to prevent duplicates)
  * @param {string} channelId 
  * @param {string} messageId 
  * @param {string} status 
+ * @returns {boolean} true if inserted, false if already existed
  */
 export function markMessageProcessed(channelId, messageId, status = 'processed') {
-  const stmt = db.prepare('INSERT INTO messages (channel_id, message_id, status) VALUES (?, ?, ?)');
-  stmt.run(channelId.toString(), messageId.toString(), status);
+  const stmt = db.prepare('INSERT OR IGNORE INTO messages (channel_id, message_id, status) VALUES (?, ?, ?)');
+  const result = stmt.run(channelId.toString(), messageId.toString(), status);
+  return result.changes > 0;
+}
+
+/**
+ * Update the status of an already-marked message
+ * @param {string} channelId 
+ * @param {string} messageId 
+ * @param {string} newStatus 
+ */
+export function updateMessageStatus(channelId, messageId, newStatus) {
+  const stmt = db.prepare('UPDATE messages SET status = ? WHERE channel_id = ? AND message_id = ?');
+  stmt.run(newStatus, channelId.toString(), messageId.toString());
 }
 
 /**
